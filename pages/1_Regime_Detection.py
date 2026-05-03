@@ -27,6 +27,9 @@ run_analysis = st.sidebar.button("Run Analysis", key="run")
 @st.cache_data
 def load_data(ticker, start, end):
     df = yf.download(ticker, start=start, end=end)
+    # Flatten MultiIndex columns from yfinance
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
     return df
 
 @st.cache_data
@@ -67,23 +70,31 @@ def train_hmm(features, n_regimes_override):
     
     return best_model, best_n
 
+def _logsumexp(a, axis=None):
+    a_max = np.max(a, axis=axis, keepdims=True)
+    out = np.log(np.sum(np.exp(a - a_max), axis=axis)) + a_max.squeeze(axis=axis if axis is not None else 0)
+    return out
+
 def forward_filter(hmm_model, features):
-    n_samples, n_features = features.shape
+    n_samples = features.shape[0]
     n_states = hmm_model.n_components
     
-    # Compute log likelihoods for all data
+    log_startprob = np.log(hmm_model.startprob_ + 1e-300)
+    log_transmat = np.log(hmm_model.transmat_ + 1e-300)
     log_likelihoods = hmm_model._compute_log_likelihood(features)
     
-    # Forward pass
+    # Forward pass in log space with numerically stable logsumexp
     log_alpha = np.zeros((n_samples, n_states))
-    log_alpha[0] = hmm_model.startprob_ + log_likelihoods[0]
+    log_alpha[0] = log_startprob + log_likelihoods[0]
     
     for t in range(1, n_samples):
-        log_alpha[t] = log_likelihoods[t] + np.log(np.sum(np.exp(log_alpha[t-1] + hmm_model.transmat_.T), axis=1))
+        for j in range(n_states):
+            log_alpha[t, j] = _logsumexp(log_alpha[t-1] + log_transmat[:, j]) + log_likelihoods[t, j]
     
-    # Convert to posterior probabilities
-    alpha = np.exp(log_alpha)
-    posterior = alpha / alpha.sum(axis=1, keepdims=True)
+    # Normalize each row to get posterior probabilities
+    log_norm = _logsumexp(log_alpha, axis=1)
+    log_posterior = log_alpha - log_norm[:, np.newaxis]
+    posterior = np.exp(log_posterior)
     
     regimes = np.argmax(posterior, axis=1)
     confidence = np.max(posterior, axis=1)
@@ -124,37 +135,41 @@ def apply_stability_filter(regimes, min_persist=3, flicker_threshold=4, window=2
 
 if run_analysis or 'data' not in st.session_state:
     with st.spinner("Loading data and running analysis..."):
-        df = load_data(ticker, start_date, end_date)
-        if df.empty:
-            st.error("No data found for the selected ticker and date range.")
+        try:
+            df = load_data(ticker, start_date, end_date)
+            if df.empty or len(df) < 50:
+                st.error("No data found for the selected ticker and date range.")
+                st.stop()
+            
+            df_clean, features = engineer_features(df)
+            
+            hmm_model, n_regimes = train_hmm(features, n_regimes_override)
+            
+            regimes, confidence = forward_filter(hmm_model, features)
+            
+            regime_labels = label_regimes(regimes, df_clean['Volatility'].values)
+            
+            filtered_regimes = apply_stability_filter(regimes)
+            
+            # Map filtered regimes to labels
+            regime_series = []
+            for r in filtered_regimes:
+                if r == -1:
+                    regime_series.append("Uncertain")
+                else:
+                    regime_series.append(regime_labels[r])
+            
+            # Store in session state
+            st.session_state['data'] = df_clean
+            st.session_state['regimes'] = regime_series
+            st.session_state['confidence'] = confidence
+            st.session_state['n_regimes'] = n_regimes
+            st.session_state['current_regime'] = regime_series[-1]
+            st.session_state['current_confidence'] = confidence[-1]
+            st.session_state['stability'] = "Uncertain" if "Uncertain" in regime_series[-20:] else "Stable"
+        except Exception as e:
+            st.error(f"Analysis failed: {e}")
             st.stop()
-        
-        df_clean, features = engineer_features(df)
-        
-        hmm_model, n_regimes = train_hmm(features, n_regimes_override)
-        
-        regimes, confidence = forward_filter(hmm_model, features)
-        
-        regime_labels = label_regimes(regimes, df_clean['Volatility'].values)
-        
-        filtered_regimes = apply_stability_filter(regimes)
-        
-        # Map filtered regimes to labels
-        regime_series = []
-        for r in filtered_regimes:
-            if r == -1:
-                regime_series.append("Uncertain")
-            else:
-                regime_series.append(regime_labels[r])
-        
-        # Store in session state
-        st.session_state['data'] = df_clean
-        st.session_state['regimes'] = regime_series
-        st.session_state['confidence'] = confidence
-        st.session_state['n_regimes'] = n_regimes
-        st.session_state['current_regime'] = regime_series[-1]
-        st.session_state['current_confidence'] = confidence[-1]
-        st.session_state['stability'] = "Uncertain" if "Uncertain" in regime_series[-20:] else "Stable"
 
 # Display results
 if 'data' in st.session_state:
@@ -233,12 +248,12 @@ if 'data' in st.session_state:
     
     regime_stats = {}
     for regime in unique_regimes:
-        mask = [r == regime for r in regimes]
+        mask = np.array([r == regime for r in regimes])
         regime_stats[regime] = {
-            'mean_return': df.loc[mask, 'Returns'].mean() * 100,
-            'mean_vol': df.loc[mask, 'Volatility'].mean() * 100,
-            'mean_vol_ratio': df.loc[mask, 'Volume_Ratio'].mean(),
-            'pct_time': np.mean(mask) * 100
+            'mean_return': df['Returns'].values[mask].mean() * 100,
+            'mean_vol': df['Volatility'].values[mask].mean() * 100,
+            'mean_vol_ratio': df['Volume_Ratio'].values[mask].mean(),
+            'pct_time': mask.mean() * 100
         }
     
     cols = st.columns(len(unique_regimes))
