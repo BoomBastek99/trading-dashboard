@@ -1,326 +1,660 @@
-import streamlit as st
-import pandas as pd
-import numpy as np
-import yfinance as yf
-from hmmlearn import hmm
-from datetime import datetime, timedelta
-import plotly.graph_objects as go
-import plotly.express as px
-from design_system import *
+"""
+Portfolio Risk Dashboard.
 
-# Apply theme
+DEMO MODE by default - sample positions are loaded so the dashboard runs
+without an Alpaca account. Replace via the sidebar editor or by uploading a
+positions CSV. Per-position HMM regime detection (forward-only), 60-day
+rolling correlation matrix, and historical stress-test scenarios.
+
+Run with:
+    py -3.13 -m streamlit run portfolio_risk_dashboard.py --server.port=8506
+"""
+
+from __future__ import annotations
+
+import textwrap
+import warnings
+from zoneinfo import ZoneInfo
+
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+import streamlit as st
+from hmmlearn.hmm import GaussianHMM
+from scipy.special import logsumexp
+from scipy.stats import multivariate_normal
+
+from data_provider import clear_cache as _clear_data_cache, get_history_recent
+from design_system import *  # noqa: F401,F403
+
+warnings.filterwarnings("ignore")
+
+st.set_page_config(
+    page_title="Portfolio Risk",
+    page_icon="◆",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 apply_theme()
 
-# Demo positions
-demo_positions = [
-    {"ticker": "SPY", "shares": 100, "entry_price": 540, "current_price": 558},
-    {"ticker": "QQQ", "shares": 50, "entry_price": 480, "current_price": 495},
-    {"ticker": "AAPL", "shares": 75, "entry_price": 210, "current_price": 218},
-    {"ticker": "GLD", "shares": 40, "entry_price": 235, "current_price": 242},
-    {"ticker": "TLT", "shares": 60, "entry_price": 88, "current_price": 85}
-]
 
-# Sidebar
-st.sidebar.header("Portfolio Management")
+def render_html(s: str) -> None:
+    """Streamlit's markdown processor closes HTML blocks when it sees an
+    indented line. Dedent + strip avoids that, so multi-line f-strings
+    render as HTML instead of leaking source into the page."""
+    st.markdown(textwrap.dedent(s).strip(), unsafe_allow_html=True)
 
-use_demo = st.sidebar.checkbox("Use Demo Portfolio", value=True)
 
-if not use_demo:
-    # Allow editing positions
-    positions = []
-    for pos in demo_positions:
-        with st.sidebar.expander(f"Edit {pos['ticker']}"):
-            shares = st.number_input(f"Shares {pos['ticker']}", value=pos['shares'], key=f"shares_{pos['ticker']}")
-            entry = st.number_input(f"Entry Price {pos['ticker']}", value=pos['entry_price'], key=f"entry_{pos['ticker']}")
-            current = st.number_input(f"Current Price {pos['ticker']}", value=pos['current_price'], key=f"current_{pos['ticker']}")
-            positions.append({"ticker": pos['ticker'], "shares": shares, "entry_price": entry, "current_price": current})
-else:
-    positions = demo_positions
+# ── Defaults ───────────────────────────────────────────────────────────────
 
-# Optional Alpaca
-alpaca_key = st.sidebar.text_input("Alpaca API Key (optional)", type="password")
-alpaca_secret = st.sidebar.text_input("Alpaca Secret (optional)", type="password")
+DEFAULT_POSITIONS = pd.DataFrame([
+    {"ticker": "SPY",  "shares": 100, "entry": 540.0, "current": 558.0},
+    {"ticker": "QQQ",  "shares":  50, "entry": 480.0, "current": 495.0},
+    {"ticker": "AAPL", "shares":  75, "entry": 210.0, "current": 218.0},
+    {"ticker": "GLD",  "shares":  40, "entry": 235.0, "current": 242.0},
+    {"ticker": "TLT",  "shares":  60, "entry":  88.0, "current":  85.0},
+])
 
-watchlist = st.sidebar.multiselect("Watchlist Tickers", ["SPY", "BTC-USD", "ETH-USD", "NVDA", "TSLA"], default=["BTC-USD"])
-
-refresh = st.sidebar.button("Refresh Data")
-
-@st.cache_data
-def download_price_data(tickers, period="2y"):
-    data = {}
-    for ticker in tickers:
-        try:
-            df = yf.download(ticker, period=period)
-            data[ticker] = df['Close']
-        except:
-            data[ticker] = pd.Series()
-    return pd.DataFrame(data)
-
-@st.cache_data
-def run_regime_detection(df):
-    if df.empty or len(df) < 50:
-        return "Unknown", 0, 0
-    
-    returns = np.log(df / df.shift(1)).dropna()
-    vol = returns.rolling(20).std().dropna()
-    features = np.column_stack([returns.values[-len(vol):], vol.values])
-    
-    if len(features) < 50:
-        return "Unknown", 0, 0
-    
-    model = hmm.GaussianHMM(n_components=3, covariance_type='full', n_iter=1000, random_state=42)
-    model.fit(features)
-    
-    # Forward filtering
-    log_likelihoods = model._compute_log_likelihood(features)
-    log_alpha = np.zeros((len(features), 3))
-    log_alpha[0] = model.startprob_ + log_likelihoods[0]
-    for t in range(1, len(features)):
-        log_alpha[t] = log_likelihoods[t] + np.log(np.sum(np.exp(log_alpha[t-1] + model.transmat_.T), axis=1))
-    alpha = np.exp(log_alpha)
-    posterior = alpha / alpha.sum(axis=1, keepdims=True)
-    current_regime = np.argmax(posterior[-1])
-    confidence = posterior[-1, current_regime]
-    days_in_regime = np.sum(np.argmax(posterior, axis=1) == current_regime)
-    
-    # Label regimes by volatility
-    regime_vols = [np.mean(vol.iloc[np.argmax(posterior, axis=1) == i]) for i in range(3)]
-    sorted_regimes = np.argsort(regime_vols)
-    regime_names = ["Low Vol", "Medium Vol", "High Vol"]
-    regime_name = regime_names[sorted_regimes.tolist().index(current_regime)]
-    
-    return regime_name, confidence, days_in_regime
-
-# Stress test drawdowns
-stress_drawdowns = {
-    "2008": {"SPY": -0.56, "QQQ": -0.54, "AAPL": -0.61, "GLD": 0.21, "TLT": 0.33},
-    "2020": {"SPY": -0.34, "QQQ": -0.28, "AAPL": -0.31, "GLD": -0.03, "TLT": 0.21},
-    "2022": {"SPY": -0.25, "QQQ": -0.33, "AAPL": -0.30, "GLD": -0.04, "TLT": -0.31}
+STRESS_DRAWDOWNS = {
+    "2008 GFC":   {"SPY": -0.56, "QQQ": -0.54, "AAPL": -0.61, "GLD": +0.21, "TLT": +0.33},
+    "2020 COVID": {"SPY": -0.34, "QQQ": -0.28, "AAPL": -0.31, "GLD": -0.03, "TLT": +0.21},
+    "2022 Hikes": {"SPY": -0.25, "QQQ": -0.33, "AAPL": -0.30, "GLD": -0.04, "TLT": -0.31},
 }
+STRESS_PROXY = "SPY"  # fallback for unknown tickers
 
-if refresh or 'portfolio_data' not in st.session_state:
-    with st.spinner("Loading portfolio data..."):
-        tickers = [p['ticker'] for p in positions] + watchlist
-        price_data = download_price_data(tickers)
-        
-        portfolio_data = []
-        for pos in positions:
-            ticker = pos['ticker']
-            current_price = price_data[ticker].iloc[-1] if ticker in price_data.columns and not price_data[ticker].empty else pos['current_price']
-            regime, conf, days = run_regime_detection(price_data[ticker] if ticker in price_data.columns else pd.Series())
-            pnl = (current_price - pos['entry_price']) * pos['shares']
-            pnl_pct = (current_price / pos['entry_price'] - 1) * 100
-            
-            portfolio_data.append({
-                'ticker': ticker,
-                'shares': pos['shares'],
-                'entry_price': pos['entry_price'],
-                'current_price': current_price,
-                'value': current_price * pos['shares'],
-                'pnl': pnl,
-                'pnl_pct': pnl_pct,
-                'regime': regime,
-                'confidence': conf,
-                'days_in_regime': days
-            })
-        
-        # Correlation matrix
-        returns_df = price_data.pct_change().dropna()
-        corr_matrix = returns_df.rolling(60).corr().groupby(level=0).last()
-        
-        # Watchlist
-        watchlist_data = []
-        for ticker in watchlist:
-            if ticker in price_data.columns and not price_data[ticker].empty:
-                price = price_data[ticker].iloc[-1]
-                regime, conf, days = run_regime_detection(price_data[ticker])
-                watchlist_data.append({
-                    'ticker': ticker,
-                    'price': price,
-                    'regime': regime,
-                    'confidence': conf,
-                    'days': days
-                })
-        
-        st.session_state['portfolio_data'] = portfolio_data
-        st.session_state['price_data'] = price_data
-        st.session_state['corr_matrix'] = corr_matrix
-        st.session_state['watchlist_data'] = watchlist_data
+VOL_RANK_LABELS = {0: "Low Vol", 1: "Medium Vol", 2: "High Vol"}
+FAVORABLE_RANKS = {0, 1}  # Low + Medium = favorable; High = unfavorable
 
-if 'portfolio_data' in st.session_state:
-    portfolio_data = st.session_state['portfolio_data']
-    corr_matrix = st.session_state['corr_matrix']
-    watchlist_data = st.session_state['watchlist_data']
-    
-    # Top bar
-    total_value = sum(p['value'] for p in portfolio_data)
-    total_pnl = sum(p['pnl'] for p in portfolio_data)
-    total_pnl_pct = (total_value / sum(p['entry_price'] * p['shares'] for p in portfolio_data) - 1) * 100
-    n_positions = len(portfolio_data)
-    favorable_regimes = sum(1 for p in portfolio_data if p['regime'] in ["Low Vol", "Medium Vol"])
-    
-    col1, col2, col3, col4, col5 = st.columns([3, 2, 2, 2, 2])
-    with col1:
-        st.markdown(f"<h1 style='color: {TEXT_PRIMARY}; font-size: 56px; margin: 0;'>{total_value:,.0f}</h1>", unsafe_allow_html=True)
-        st.markdown("<p style='color: " + TEXT_MUTED + "; margin: 0;'>Total Portfolio Value</p>", unsafe_allow_html=True)
-    with col2:
-        color = pnl_color(total_pnl_pct)
-        st.markdown(f"<h2 style='color: {color}; margin: 0;'>{total_pnl:,.0f}</h2>", unsafe_allow_html=True)
-        st.markdown(f"<p style='color: {TEXT_MUTED}; margin: 0;'>{'▲' if total_pnl > 0 else '▼'} {abs(total_pnl_pct):.1f}%</p>", unsafe_allow_html=True)
-    with col3:
-        st.markdown(f"<h3 style='color: {TEXT_SECONDARY}; margin: 0;'>{n_positions}</h3>", unsafe_allow_html=True)
-        st.markdown("<p style='color: " + TEXT_MUTED + "; margin: 0;'>Positions</p>", unsafe_allow_html=True)
-    with col4:
-        st.markdown(f"<h3 style='color: {TEXT_SECONDARY}; margin: 0;'>{favorable_regimes}/{n_positions}</h3>", unsafe_allow_html=True)
-        st.markdown("<p style='color: " + TEXT_MUTED + "; margin: 0;'>Favorable Regimes</p>", unsafe_allow_html=True)
-    with col5:
-        st.markdown("<span style='color: " + ACCENT_GREEN + "; font-size: 24px;'>●</span>", unsafe_allow_html=True)
-        st.markdown("<p style='color: " + TEXT_MUTED + "; margin: 0;'>Market Open</p>", unsafe_allow_html=True)
-    
-    # Positions
+FEATURE_COLS = ["log_ret", "realized_vol", "volume_ratio", "hl_range_pct"]
+
+
+# ── Data + features ────────────────────────────────────────────────────────
+
+def fetch_history(ticker: str, lookback_days: int = 504) -> pd.DataFrame:
+    """Thin wrapper around the unified data provider (FMP → TwelveData → yfinance)."""
+    return get_history_recent(ticker, lookback_days)
+
+
+def build_features(df: pd.DataFrame) -> pd.DataFrame:
+    out = pd.DataFrame(index=df.index)
+    close = df["Close"].astype(float)
+    high = df["High"].astype(float)
+    low = df["Low"].astype(float)
+    vol = df["Volume"].astype(float) if "Volume" in df.columns else pd.Series(0.0, index=df.index)
+
+    out["log_ret"] = np.log(close).diff()
+    out["realized_vol"] = out["log_ret"].rolling(20).std()
+
+    if vol.sum() > 0:
+        avg_vol = vol.rolling(20).mean()
+        out["volume_ratio"] = (vol / avg_vol).replace([np.inf, -np.inf], np.nan)
+    else:
+        abs_ret = out["log_ret"].abs()
+        out["volume_ratio"] = abs_ret.rolling(5).mean() / (abs_ret.rolling(60).mean() + 1e-9)
+
+    out["hl_range_pct"] = (high - low) / close
+    out["close"] = close
+    return out.dropna()
+
+
+# ── HMM (forward-only, no look-ahead) ─────────────────────────────────────
+
+def fit_hmm(X: np.ndarray, n_components: int = 3, seed: int = 42) -> GaussianHMM:
+    m = GaussianHMM(
+        n_components=n_components, covariance_type="diag",
+        n_iter=150, tol=1e-3, random_state=seed,
+    )
+    m.fit(X)
+    return m
+
+
+def emission_logprob(model: GaussianHMM, X: np.ndarray) -> np.ndarray:
+    T, K = X.shape[0], model.n_components
+    out = np.empty((T, K))
+    for k in range(K):
+        out[:, k] = multivariate_normal.logpdf(X, mean=model.means_[k], cov=model.covars_[k])
+    return out
+
+
+def forward_filter(model: GaussianHMM, X: np.ndarray) -> np.ndarray:
+    T = X.shape[0]
+    log_start = np.log(model.startprob_ + 1e-300)
+    log_trans = np.log(model.transmat_ + 1e-300)
+    log_b = emission_logprob(model, X)
+    log_alpha = np.empty_like(log_b)
+    log_alpha[0] = log_start + log_b[0]
+    for t in range(1, T):
+        log_alpha[t] = logsumexp(log_alpha[t - 1][:, None] + log_trans, axis=0) + log_b[t]
+    return np.exp(log_alpha - logsumexp(log_alpha, axis=1, keepdims=True))
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def analyze_ticker(ticker: str, lookback_days: int = 504) -> dict:
+    """Returns regime label, confidence, days-in-regime, latest close, and the
+    full close series for downstream correlation work."""
+    df = fetch_history(ticker, lookback_days)
+    if df.empty:
+        return {"ok": False, "ticker": ticker, "error": "no data from yfinance"}
+    feat = build_features(df)
+    if len(feat) < 100:
+        return {"ok": False, "ticker": ticker, "error": f"only {len(feat)} bars after warmup"}
+
+    X = feat[FEATURE_COLS].values
+    try:
+        model = fit_hmm(X, n_components=3)
+        filtered = forward_filter(model, X)
+    except Exception as exc:
+        return {"ok": False, "ticker": ticker, "error": f"HMM failed: {exc}"}
+
+    vol_idx = FEATURE_COLS.index("realized_vol")
+    order = np.argsort(model.means_[:, vol_idx])
+    raw_to_label = {int(raw): VOL_RANK_LABELS[r] for r, raw in enumerate(order)}
+    raw_to_rank = {int(raw): r for r, raw in enumerate(order)}
+
+    raw_states = filtered.argmax(axis=1)
+    labels = np.array([raw_to_label[s] for s in raw_states])
+    confidence = filtered.max(axis=1)
+
+    cur_label = str(labels[-1])
+    cur_conf = float(confidence[-1])
+    cur_rank = int(raw_to_rank[int(raw_states[-1])])
+
+    # Days in current regime: count consecutive matching bars from the end
+    days = 1
+    for i in range(len(labels) - 2, -1, -1):
+        if labels[i] == cur_label:
+            days += 1
+        else:
+            break
+
+    return {
+        "ok": True,
+        "ticker": ticker,
+        "label": cur_label,
+        "rank": cur_rank,
+        "confidence": cur_conf,
+        "days_in_regime": int(days),
+        "current_price": float(feat["close"].iloc[-1]),
+        "close": feat["close"].rename(ticker),
+    }
+
+
+# ── Correlation ────────────────────────────────────────────────────────────
+
+def correlation_matrix(closes: list[pd.Series], lookback: int = 60) -> pd.DataFrame:
+    if not closes:
+        return pd.DataFrame()
+    df = pd.concat(closes, axis=1).dropna()
+    if len(df) < lookback + 5:
+        return pd.DataFrame()
+    rets = df.pct_change().dropna()
+    return rets.tail(lookback).corr()
+
+
+# ── Stress test ────────────────────────────────────────────────────────────
+
+def stress_drawdown(ticker: str, scenario: str) -> float:
+    table = STRESS_DRAWDOWNS[scenario]
+    return table.get(ticker, table[STRESS_PROXY])
+
+
+def portfolio_stress(positions: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    pv = (positions["shares"] * positions["current"]).sum()
+    for scenario in STRESS_DRAWDOWNS:
+        loss_dollars = float(sum(
+            row["shares"] * row["current"] * stress_drawdown(row["ticker"], scenario)
+            for _, row in positions.iterrows()
+        ))
+        loss_pct = (loss_dollars / pv) if pv > 0 else 0.0
+        rows.append({"scenario": scenario, "loss_dollars": loss_dollars, "loss_pct": loss_pct})
+    return pd.DataFrame(rows)
+
+
+# ── Market status ──────────────────────────────────────────────────────────
+
+def us_market_status() -> tuple[bool, str]:
+    try:
+        now_et = pd.Timestamp.now(tz=ZoneInfo("America/New_York"))
+    except Exception:
+        return False, "Unknown"
+    is_weekday = now_et.weekday() < 5
+    minutes = now_et.hour * 60 + now_et.minute
+    is_hours = (9 * 60 + 30) <= minutes < (16 * 60)
+    if is_weekday and is_hours:
+        return True, f"Open · {now_et.strftime('%H:%M')} ET"
+    return False, f"Closed · {now_et.strftime('%a %H:%M')} ET"
+
+
+# ── Sidebar ────────────────────────────────────────────────────────────────
+
+with st.sidebar:
     st.markdown(section_header("Positions"), unsafe_allow_html=True)
-    
-    for pos in portfolio_data:
-        color = REGIME_COLORS.get(pos['regime'], ACCENT_VIOLET)
-        pnl_bar_width = min(abs(pos['pnl_pct']) * 2, 100)  # Scale for visualization
-        
-        st.markdown(f"""
-        <div style="
-            background-color: {BG_CARD};
-            border: 1px solid {BORDER};
-            border-radius: 8px;
-            padding: 15px;
-            margin: 10px 0;
-            display: flex;
-            align-items: center;
-        ">
-            <div style="flex: 1;">
-                <h3 style="color: {TEXT_PRIMARY}; margin: 0 0 5px 0;">{pos['ticker']}</h3>
-                <p style="color: {TEXT_SECONDARY}; margin: 0;">{regime_badge(pos['regime'], int(pos['confidence']*100))}</p>
-                <p style="color: {TEXT_MUTED}; margin: 0; font-size: 12px;">{pos['days_in_regime']} days in regime</p>
+
+    upload = st.file_uploader("Upload positions CSV", type=["csv"])
+    csv_positions = None
+    if upload is not None:
+        try:
+            csv_positions = pd.read_csv(upload)
+            csv_positions.columns = [c.strip().lower() for c in csv_positions.columns]
+            for col in ["ticker", "shares", "entry", "current"]:
+                if col not in csv_positions.columns:
+                    raise ValueError(f"missing column: {col}")
+            csv_positions["ticker"] = csv_positions["ticker"].str.upper().str.strip()
+        except Exception as exc:
+            st.error(f"CSV error: {exc}")
+            csv_positions = None
+
+    initial = csv_positions if csv_positions is not None else DEFAULT_POSITIONS
+    positions = st.data_editor(
+        initial,
+        num_rows="dynamic",
+        use_container_width=True,
+        column_config={
+            "ticker":  st.column_config.TextColumn("Ticker", required=True),
+            "shares":  st.column_config.NumberColumn("Shares", min_value=0, step=1),
+            "entry":   st.column_config.NumberColumn("Entry $", min_value=0.0, format="%.2f"),
+            "current": st.column_config.NumberColumn("Current $", min_value=0.0, format="%.2f"),
+        },
+        key="positions_editor",
+    )
+
+    st.markdown(section_header("Watchlist"), unsafe_allow_html=True)
+    watch_str = st.text_input("Extra tickers (comma separated)", value="")
+
+    st.markdown(section_header("Alpaca (optional)"), unsafe_allow_html=True)
+    st.caption("Demo mode: keys are not transmitted. Live integration is a future enhancement.")
+    st.text_input("API key", value="", type="password", key="alpaca_key", disabled=True)
+    st.text_input("API secret", value="", type="password", key="alpaca_secret", disabled=True)
+
+    refresh = st.button("Refresh Analysis", type="primary", use_container_width=True)
+
+
+# ── Run ─────────────────────────────────────────────────────────────────────
+
+# Clean positions: drop rows with no ticker / zero shares
+positions = positions.dropna(subset=["ticker"]).copy()
+positions["ticker"] = positions["ticker"].astype(str).str.upper().str.strip()
+positions = positions[positions["ticker"] != ""]
+positions = positions[positions["shares"].fillna(0) > 0].reset_index(drop=True)
+
+if len(positions) == 0:
+    st.markdown(
+        f"<div style='color:{TEXT_MUTED};padding:64px 0;text-align:center;'>"
+        f"Add at least one position in the sidebar editor.</div>",
+        unsafe_allow_html=True,
+    )
+    st.stop()
+
+# Always analyse on initial load (cached) - "Refresh" just busts the cache
+if refresh:
+    _clear_data_cache()
+    analyze_ticker.clear()
+
+with st.spinner("Analysing positions..."):
+    progress = st.progress(0.0, text="Starting...")
+    analyses: dict[str, dict] = {}
+    for i, t in enumerate(positions["ticker"].tolist()):
+        progress.progress(i / len(positions), text=f"Analysing {t}...")
+        analyses[t] = analyze_ticker(t)
+    progress.empty()
+
+# Watchlist
+watchlist_tickers = [
+    t.strip().upper() for t in watch_str.split(",") if t.strip().upper() and t.strip().upper() not in analyses
+]
+watchlist: dict[str, dict] = {}
+if watchlist_tickers:
+    with st.spinner("Loading watchlist..."):
+        for t in watchlist_tickers:
+            watchlist[t] = analyze_ticker(t)
+
+
+# ── Rate-limit / failure banner ────────────────────────────────────────────
+
+failed = [t for t, a in analyses.items() if not a.get("ok")]
+if failed:
+    rate_limited = any("rate" in (a.get("error") or "").lower() or "too many" in (a.get("error") or "").lower()
+                       for a in analyses.values() if not a.get("ok"))
+    if rate_limited or len(failed) == len(analyses):
+        render_html(f"""
+            <div style='background:rgba(255,193,7,0.10);border:1px solid {ACCENT_AMBER};border-left:3px solid {ACCENT_AMBER};border-radius:10px;padding:12px 18px;margin-bottom:12px;font-family:DM Sans;color:{TEXT_PRIMARY};font-size:0.85rem;'>
+              <b style='color:{ACCENT_AMBER};text-transform:uppercase;letter-spacing:2px;font-size:0.7rem;'>yfinance rate-limited</b>
+              &nbsp;·&nbsp; {len(failed)} of {len(analyses)} ticker(s) couldn't fetch price history. Wait a few minutes, then click <b style='color:{ACCENT_CYAN}'>Refresh Analysis</b>. Stress test and P&L still work from your editor values.
             </div>
-            <div style="flex: 1; text-align: center;">
-                <p style="color: {TEXT_SECONDARY}; margin: 0;">Entry: ${pos['entry_price']:.2f}</p>
-                <p style="color: {TEXT_SECONDARY}; margin: 0;">Current: ${pos['current_price']:.2f}</p>
+        """)
+    else:
+        render_html(f"""
+            <div style='background:rgba(255,193,7,0.06);border:1px solid {BORDER};border-radius:10px;padding:10px 16px;margin-bottom:12px;font-family:DM Sans;color:{TEXT_MUTED};font-size:0.8rem;'>
+              {len(failed)} ticker(s) had no regime data: {', '.join(failed)}
             </div>
-            <div style="flex: 1;">
-                <div style="
-                    height: 20px;
-                    background-color: {BG_CARD_HOVER};
-                    border-radius: 10px;
-                    overflow: hidden;
-                    position: relative;
-                ">
-                    <div style="
-                        height: 100%;
-                        width: {pnl_bar_width}%;
-                        background-color: {pnl_color(pos['pnl_pct'])};
-                        position: absolute;
-                        left: {0 if pos['pnl_pct'] >= 0 else 100 - pnl_bar_width}%;
-                    "></div>
-                </div>
-                <p style="color: {pnl_color(pos['pnl_pct'])}; margin: 5px 0 0 0; text-align: center;">{pos['pnl_pct']:+.1f}%</p>
-            </div>
+        """)
+
+
+# ── Top bar ────────────────────────────────────────────────────────────────
+
+market_open, market_text = us_market_status()
+positions["value"] = positions["shares"] * positions["current"]
+positions["cost"] = positions["shares"] * positions["entry"]
+positions["pnl_dollars"] = positions["value"] - positions["cost"]
+positions["pnl_pct"] = (positions["current"] / positions["entry"] - 1.0) * 100
+
+total_value = float(positions["value"].sum())
+total_cost = float(positions["cost"].sum())
+total_pnl = total_value - total_cost
+total_pnl_pct = (total_value / total_cost - 1.0) * 100 if total_cost > 0 else 0.0
+
+n_positions = len(positions)
+n_favorable = sum(
+    1 for t in positions["ticker"]
+    if analyses[t].get("ok") and analyses[t]["rank"] in FAVORABLE_RANKS
+)
+
+arrow = "▲" if total_pnl >= 0 else "▼"
+pnl_col = pnl_color(total_pnl)
+
+cols = st.columns([2.0, 1.4, 0.9, 1.3, 1.1])
+with cols[0]:
+    st.markdown(
+        f"""
+        <div style='padding:6px 0;'>
+            <div style='font-family:DM Sans;font-size:0.7rem;color:{TEXT_MUTED};
+                        text-transform:uppercase;letter-spacing:2px;'>Portfolio Value</div>
+            <div style='font-family:JetBrains Mono;font-size:3.2rem;font-weight:700;
+                        color:{TEXT_PRIMARY};line-height:1.05;
+                        text-shadow:0 0 22px rgba(0,212,255,0.35);'>
+                ${total_value:,.0f}</div>
         </div>
-        """, unsafe_allow_html=True)
-    
-    # Correlation Heatmap
-    st.markdown(section_header("Correlation Risk"), unsafe_allow_html=True)
-    
-    corr_subset = corr_matrix.loc[:, [p['ticker'] for p in portfolio_data]].dropna()
-    if not corr_subset.empty:
-        fig_corr = px.imshow(
-            corr_subset.corr(),
-            color_continuous_scale=[BG_PRIMARY, ACCENT_CYAN, TEXT_PRIMARY],
-            aspect="auto"
-        )
-        fig_corr.update_layout(**get_plotly_layout())
-        st.plotly_chart(fig_corr, use_container_width=True)
-    
-    # Stress Test
-    st.markdown(section_header("Stress Test"), unsafe_allow_html=True)
-    
-    stress_results = []
-    for scenario, drawdowns in stress_drawdowns.items():
-        portfolio_loss = 0
-        portfolio_loss_pct = 0
-        for pos in portfolio_data:
-            dd = drawdowns.get(pos['ticker'], drawdowns.get('SPY', -0.25))  # Default to SPY
-            loss = pos['value'] * abs(dd)
-            portfolio_loss += loss
-            portfolio_loss_pct += (loss / total_value) * 100
-        
-        severity_color = ACCENT_GREEN if portfolio_loss_pct < 10 else ACCENT_AMBER if portfolio_loss_pct < 20 else ACCENT_RED
-        
-        st.markdown(f"""
-        <div style="
-            background-color: {BG_CARD};
-            border: 1px solid {BORDER};
-            border-radius: 8px;
-            padding: 15px;
-            margin: 10px 0;
-        ">
-            <h4 style="color: {TEXT_PRIMARY}; margin: 0 0 10px 0;">{scenario}</h4>
-            <div style="display: flex; align-items: center;">
-                <div style="flex: 1;">
-                    <p style="color: {severity_color}; font-size: 24px; margin: 0;">${portfolio_loss:,.0f}</p>
-                    <p style="color: {TEXT_SECONDARY}; margin: 0;">{portfolio_loss_pct:.1f}% loss</p>
+        """,
+        unsafe_allow_html=True,
+    )
+with cols[1]:
+    st.markdown(
+        f"""
+        <div style='padding:6px 0;'>
+            <div style='font-family:DM Sans;font-size:0.7rem;color:{TEXT_MUTED};
+                        text-transform:uppercase;letter-spacing:2px;'>Total P&L</div>
+            <div style='font-family:JetBrains Mono;font-size:1.9rem;font-weight:700;
+                        color:{pnl_col};line-height:1.1;'>
+                {arrow} ${abs(total_pnl):,.0f}</div>
+            <div style='font-family:JetBrains Mono;font-size:1.0rem;color:{pnl_col};'>
+                {total_pnl_pct:+.2f}%</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+with cols[2]:
+    st.markdown(metric_card("Positions", str(n_positions), ACCENT_VIOLET), unsafe_allow_html=True)
+with cols[3]:
+    fav_color = ACCENT_GREEN if n_favorable >= n_positions * 0.6 else (ACCENT_AMBER if n_favorable > 0 else ACCENT_RED)
+    st.markdown(
+        metric_card("Regime Health", f"{n_favorable} / {n_positions}", fav_color),
+        unsafe_allow_html=True,
+    )
+with cols[4]:
+    dot = status_dot("connected" if market_open else "warning")
+    color = ACCENT_GREEN if market_open else ACCENT_AMBER
+    st.markdown(
+        f"""
+        <div style='padding:18px 14px;background:{BG_CARD};border:1px solid {BORDER};
+                    border-radius:12px;text-align:center;'>
+            <div style='font-family:DM Sans;font-size:0.65rem;color:{TEXT_MUTED};
+                        text-transform:uppercase;letter-spacing:1.5px;margin-bottom:8px;'>
+                Market</div>
+            <div style='font-family:JetBrains Mono;font-size:1.0rem;color:{color};'>
+                {dot}{'OPEN' if market_open else 'CLOSED'}</div>
+            <div style='font-family:JetBrains Mono;font-size:0.7rem;color:{TEXT_MUTED};
+                        margin-top:4px;'>{market_text}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+# ── Two-column body ────────────────────────────────────────────────────────
+
+left, right = st.columns([1.5, 1.0])
+
+
+# ─ Position cards (left, ~60%) ─────────────────────────────────────────────
+
+def pnl_bar_html(pnl_pct: float) -> str:
+    """Center-anchored P&L bar. Right-fill (green) for gains, left-fill (red) for losses.
+    Full extension (50% of container width) at +/-20% P&L."""
+    abs_pct = min(abs(pnl_pct) / 20.0 * 50.0, 50.0)
+    if pnl_pct >= 0:
+        side, color = "left", ACCENT_GREEN
+    else:
+        side, color = "right", ACCENT_RED
+    return (
+        f"<div style='position:relative;height:8px;background:rgba(255,255,255,0.04);"
+        f"border-radius:4px;overflow:hidden;margin:6px 0;'>"
+        f"<div style='position:absolute;left:50%;top:0;width:1px;height:100%;"
+        f"background:rgba(255,255,255,0.25);'></div>"
+        f"<div style='position:absolute;{side}:50%;top:0;width:{abs_pct}%;height:100%;"
+        f"background:{color};border-radius:3px;box-shadow:0 0 12px {color}66;'></div>"
+        f"</div>"
+    )
+
+
+with left:
+    st.markdown(section_header("Positions"), unsafe_allow_html=True)
+
+    for _, row in positions.iterrows():
+        t = row["ticker"]
+        a = analyses.get(t, {})
+        pos_color = pnl_color(row["pnl_pct"])
+
+        if a.get("ok"):
+            badge_html = regime_badge(a["label"], a["confidence"] * 100)
+            days_html = (
+                f"<span style='font-family:JetBrains Mono;color:{TEXT_MUTED};font-size:0.72rem;'>"
+                f"{a['days_in_regime']}d in regime</span>"
+            )
+        else:
+            badge_html = (
+                f"<span style='color:{TEXT_MUTED};font-family:DM Sans;font-size:0.75rem;'>"
+                f"regime unavailable</span>"
+            )
+            days_html = ""
+
+        render_html(f"""
+            <div style='background:{BG_CARD};border:1px solid {BORDER};border-radius:12px;padding:16px 20px;margin-bottom:12px;'>
+              <div style='display:flex;align-items:center;justify-content:space-between;gap:14px;'>
+                <div style='display:flex;align-items:center;gap:14px;flex:1;'>
+                  <div style='font-family:DM Sans;font-size:1.15rem;color:{TEXT_PRIMARY};font-weight:700;min-width:70px;'>{t}</div>
+                  <div>{badge_html}</div>
+                  {days_html}
                 </div>
-                <div style="flex: 1;">
-                    <div style="
-                        height: 20px;
-                        background-color: {BG_CARD_HOVER};
-                        border-radius: 10px;
-                        overflow: hidden;
-                    ">
-                        <div style="
-                            height: 100%;
-                            width: {min(portfolio_loss_pct * 5, 100)}%;
-                            background-color: {severity_color};
-                        "></div>
+                <div style='text-align:right;font-family:JetBrains Mono;font-size:0.78rem;color:{TEXT_MUTED};'>{int(row['shares'])} sh &nbsp;·&nbsp; ${row['entry']:.2f} → <span style='color:{TEXT_PRIMARY}'>${row['current']:.2f}</span></div>
+              </div>
+              {pnl_bar_html(row['pnl_pct'])}
+              <div style='display:flex;justify-content:space-between;align-items:center;font-family:JetBrains Mono;font-size:0.85rem;'>
+                <span style='color:{TEXT_MUTED};'>P&L</span>
+                <span style='color:{pos_color};font-weight:600;'>{'+' if row['pnl_dollars'] >= 0 else ''}${row['pnl_dollars']:,.0f} &nbsp;·&nbsp; {row['pnl_pct']:+.2f}%</span>
+              </div>
+            </div>
+        """)
+
+
+# ─ Right column panels ─────────────────────────────────────────────────────
+
+with right:
+    # Correlation
+    st.markdown(section_header("Correlation Risk"), unsafe_allow_html=True)
+    closes = [a["close"] for a in analyses.values() if a.get("ok") and "close" in a]
+    corr = correlation_matrix(closes, lookback=60)
+
+    if corr.empty:
+        st.markdown(
+            f"<div style='color:{TEXT_MUTED};font-family:DM Sans;font-size:0.85rem;"
+            f"padding:18px 0;'>Need at least 2 positions with overlapping history.</div>",
+            unsafe_allow_html=True,
+        )
+        high_pairs = []
+    else:
+        n = len(corr)
+        # Discrete-ish blue-to-white scale
+        scale = [
+            [0.00, "#0a0f2a"], [0.30, "#0a3a5a"], [0.55, "#0a6a8a"],
+            [0.75, ACCENT_CYAN], [0.90, "#bfeaff"], [1.00, "#ffffff"],
+        ]
+        z = corr.values
+        text = [[f"{v:.2f}" for v in row] for row in z]
+
+        cfig = go.Figure(go.Heatmap(
+            z=z, x=corr.columns, y=corr.index,
+            zmin=-1, zmax=1, colorscale=scale,
+            showscale=False, xgap=2, ygap=2,
+            text=text, texttemplate="%{text}",
+            textfont={"family": "JetBrains Mono", "size": 11, "color": BG_PRIMARY},
+            hovertemplate="%{y} / %{x}<br>r=%{z:.3f}<extra></extra>",
+        ))
+
+        # Red border for high-correlation off-diagonal cells
+        shapes = []
+        for i in range(n):
+            for j in range(n):
+                if i != j and abs(z[i, j]) > 0.85:
+                    shapes.append(dict(
+                        type="rect",
+                        x0=j - 0.48, x1=j + 0.48,
+                        y0=i - 0.48, y1=i + 0.48,
+                        line=dict(color=ACCENT_RED, width=2),
+                        fillcolor="rgba(0,0,0,0)",
+                    ))
+
+        cl = get_plotly_layout()
+        cl["height"] = 60 + 50 * n
+        cl["margin"] = dict(l=70, r=10, t=10, b=40)
+        cl["xaxis"]["showgrid"] = False
+        cl["yaxis"]["showgrid"] = False
+        cl["yaxis"]["autorange"] = "reversed"
+        cl["shapes"] = shapes
+        cfig.update_layout(**cl)
+        st.plotly_chart(cfig, use_container_width=True)
+
+        # List of high-corr pairs
+        high_pairs = []
+        seen = set()
+        for i in range(n):
+            for j in range(n):
+                if i != j and (j, i) not in seen and abs(z[i, j]) > 0.85:
+                    high_pairs.append((corr.index[i], corr.columns[j], float(z[i, j])))
+                    seen.add((i, j))
+
+        if high_pairs:
+            warns = "".join(
+                f"<li><b style='color:{ACCENT_RED}'>{a}</b> ↔ "
+                f"<b style='color:{ACCENT_RED}'>{b}</b> &nbsp;r = {r:+.2f}</li>"
+                for a, b, r in high_pairs
+            )
+            st.markdown(
+                f"""
+                <div style='background:rgba(255,23,68,0.08);border:1px solid {ACCENT_RED};
+                            border-left:3px solid {ACCENT_RED};border-radius:10px;
+                            padding:12px 16px;margin-top:10px;
+                            font-family:DM Sans;font-size:0.82rem;color:{TEXT_SECONDARY};'>
+                    <div style='font-family:DM Sans;font-size:0.7rem;color:{ACCENT_RED};
+                                text-transform:uppercase;letter-spacing:2px;font-weight:700;
+                                margin-bottom:6px;'>High correlation (|r| &gt; 0.85)</div>
+                    <ul style='margin:0;padding-left:18px;line-height:1.6;'>{warns}</ul>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+    # Stress test
+    st.markdown(section_header("Stress Test"), unsafe_allow_html=True)
+    stress_df = portfolio_stress(positions)
+    for _, row in stress_df.iterrows():
+        loss_pct = row["loss_pct"]
+        loss_dollars = row["loss_dollars"]
+        abs_pct = abs(loss_pct) * 100
+
+        if abs_pct < 10:
+            tile_color = ACCENT_GREEN
+        elif abs_pct < 20:
+            tile_color = ACCENT_AMBER
+        else:
+            tile_color = ACCENT_RED
+
+        bar_pct = min(abs_pct / 50.0 * 100.0, 100.0)
+        bar_dir = pnl_color(loss_dollars)  # red if loss, green if gain
+
+        st.markdown(
+            f"""
+            <div style='background:{BG_CARD};border:1px solid {BORDER};
+                        border-left:3px solid {tile_color};border-radius:10px;
+                        padding:14px 18px;margin-bottom:10px;'>
+                <div style='display:flex;justify-content:space-between;align-items:baseline;'>
+                    <div style='font-family:DM Sans;font-size:0.85rem;color:{TEXT_PRIMARY};
+                                font-weight:600;'>{row['scenario']}</div>
+                    <div style='font-family:JetBrains Mono;font-size:1.2rem;font-weight:700;
+                                color:{bar_dir};'>
+                        {'+' if loss_dollars >= 0 else '−'}${abs(loss_dollars):,.0f}
+                    </div>
+                </div>
+                <div style='display:flex;justify-content:space-between;align-items:center;
+                            margin-top:4px;'>
+                    <div style='flex:1;height:6px;background:rgba(255,255,255,0.04);
+                                border-radius:3px;margin-right:10px;overflow:hidden;'>
+                        <div style='width:{bar_pct}%;height:100%;background:{bar_dir};
+                                    border-radius:3px;'></div>
+                    </div>
+                    <div style='font-family:JetBrains Mono;font-size:0.85rem;color:{bar_dir};
+                                min-width:60px;text-align:right;'>
+                        {loss_pct*100:+.1f}%
                     </div>
                 </div>
             </div>
-        </div>
-        """, unsafe_allow_html=True)
-    
-    # Regime Watchlist
+            """,
+            unsafe_allow_html=True,
+        )
+
+    # Watchlist
     st.markdown(section_header("Watchlist"), unsafe_allow_html=True)
-    
-    for item in watchlist_data:
-        st.markdown(f"""
-        <div style="
-            background-color: {BG_CARD};
-            border: 1px solid {BORDER};
-            border-radius: 8px;
-            padding: 10px;
-            margin: 5px 0;
-            display: flex;
-            align-items: center;
-        ">
-            <div style="flex: 1;">
-                <strong style="color: {TEXT_PRIMARY};">{item['ticker']}</strong>
-                <p style="color: {TEXT_SECONDARY}; margin: 0;">${item['price']:.2f}</p>
-            </div>
-            <div style="flex: 1;">
-                {regime_badge(item['regime'], int(item['confidence']*100))}
-            </div>
-            <div style="flex: 1; text-align: right;">
-                <div style="
-                    height: 8px;
-                    background-color: {BG_CARD_HOVER};
-                    border-radius: 4px;
-                    overflow: hidden;
-                ">
-                    <div style="
-                        height: 100%;
-                        width: {item['confidence']*100}%;
-                        background-color: {REGIME_COLORS.get(item['regime'], ACCENT_VIOLET)};
-                    "></div>
+    if not watchlist:
+        st.markdown(
+            f"<div style='color:{TEXT_MUTED};font-family:DM Sans;font-size:0.85rem;"
+            f"padding:8px 0;'>Add tickers in the sidebar to monitor regimes.</div>",
+            unsafe_allow_html=True,
+        )
+    else:
+        ranked = sorted(
+            [(t, a) for t, a in watchlist.items() if a.get("ok")],
+            key=lambda kv: kv[1]["confidence"],
+            reverse=True,
+        )
+        for t, a in ranked:
+            badge = regime_badge(a["label"], a["confidence"] * 100)
+            conf_pct = a["confidence"] * 100
+            bar_color = REGIME_COLORS.get(a["label"], ACCENT_VIOLET)
+            st.markdown(
+                f"""
+                <div style='background:{BG_CARD};border:1px solid {BORDER};border-radius:10px;
+                            padding:12px 16px;margin-bottom:8px;'>
+                    <div style='display:flex;align-items:center;justify-content:space-between;
+                                gap:12px;margin-bottom:8px;'>
+                        <div>
+                            <span style='font-family:DM Sans;font-size:1.0rem;font-weight:700;
+                                         color:{TEXT_PRIMARY};'>{t}</span>
+                            <span style='font-family:JetBrains Mono;font-size:0.78rem;
+                                         color:{TEXT_MUTED};margin-left:10px;'>
+                                ${a['current_price']:,.2f}</span>
+                        </div>
+                        <div>{badge}</div>
+                    </div>
+                    <div style='height:4px;background:rgba(255,255,255,0.04);border-radius:2px;
+                                overflow:hidden;'>
+                        <div style='width:{conf_pct}%;height:100%;background:{bar_color};
+                                    border-radius:2px;'></div>
+                    </div>
                 </div>
-                <p style="color: {TEXT_MUTED}; margin: 0; font-size: 12px;">{item['days']} days</p>
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
-else:
-    st.info("Click 'Refresh Data' to load portfolio information.")
+                """,
+                unsafe_allow_html=True,
+            )
+        # Note any failures
+        for t, a in watchlist.items():
+            if not a.get("ok"):
+                st.caption(f"⚠ {t}: {a.get('error','unknown error')}")

@@ -1,3 +1,22 @@
+# Secrets — never commit
+.streamlit/secrets.toml
+
+# Local alert log
+correlation_alerts.json
+
+# Python
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
 .env
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
