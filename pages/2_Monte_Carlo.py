@@ -122,6 +122,24 @@ def run_monte_carlo(
 with st.sidebar:
     st.markdown(section_header("Inputs"), unsafe_allow_html=True)
     upload = st.file_uploader("Backtest CSV (date, trade_return)", type=["csv"])
+
+    # Offer the bundled sample CSV so users can see the expected schema
+    # without leaving the app.
+    import os as _os
+    _sample_path = _os.path.join(
+        _os.path.dirname(_os.path.dirname(__file__)),
+        "samples", "sample_backtest.csv",
+    )
+    if _os.path.exists(_sample_path):
+        with open(_sample_path, "rb") as _f:
+            st.download_button(
+                "Download sample CSV",
+                data=_f.read(),
+                file_name="sample_backtest.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+
     capital = st.number_input(
         "Starting capital ($)",
         min_value=1000.0,
