@@ -163,7 +163,7 @@ if run_analysis or 'data' not in st.session_state:
             st.session_state['data'] = df_clean
             st.session_state['regimes'] = regime_series
             st.session_state['confidence'] = confidence
-            st.session_state['n_regimes'] = n_regimes
+            st.session_state['detected_n_regimes'] = n_regimes
             st.session_state['current_regime'] = regime_series[-1]
             st.session_state['current_confidence'] = confidence[-1]
             st.session_state['stability'] = "Uncertain" if "Uncertain" in regime_series[-20:] else "Stable"
@@ -176,7 +176,7 @@ if 'data' in st.session_state:
     df = st.session_state['data']
     regimes = st.session_state['regimes']
     confidence = st.session_state['confidence']
-    n_regimes = st.session_state['n_regimes']
+    n_regimes = st.session_state['detected_n_regimes']
     current_regime = st.session_state['current_regime']
     current_confidence = st.session_state['current_confidence']
     stability = st.session_state['stability']
