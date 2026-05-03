@@ -133,7 +133,13 @@ def apply_stability_filter(regimes, min_persist=3, flicker_threshold=4, window=2
     
     return filtered
 
-if run_analysis or 'data' not in st.session_state:
+_ALL_KEYS = ['data', 'regimes', 'confidence', 'detected_n_regimes',
+             'current_regime', 'current_confidence', 'stability']
+
+def _results_ready():
+    return all(k in st.session_state for k in _ALL_KEYS)
+
+if run_analysis or not _results_ready():
     with st.spinner("Loading data and running analysis..."):
         try:
             df = load_data(ticker, start_date, end_date)
@@ -143,7 +149,7 @@ if run_analysis or 'data' not in st.session_state:
             
             df_clean, features = engineer_features(df)
             
-            hmm_model, n_regimes = train_hmm(features, n_regimes_override)
+            hmm_model, n_regimes_detected = train_hmm(features, n_regimes_override)
             
             regimes, confidence = forward_filter(hmm_model, features)
             
@@ -159,11 +165,11 @@ if run_analysis or 'data' not in st.session_state:
                 else:
                     regime_series.append(regime_labels[r])
             
-            # Store in session state
+            # Store in session state atomically
             st.session_state['data'] = df_clean
             st.session_state['regimes'] = regime_series
             st.session_state['confidence'] = confidence
-            st.session_state['detected_n_regimes'] = n_regimes
+            st.session_state['detected_n_regimes'] = n_regimes_detected
             st.session_state['current_regime'] = regime_series[-1]
             st.session_state['current_confidence'] = confidence[-1]
             st.session_state['stability'] = "Uncertain" if "Uncertain" in regime_series[-20:] else "Stable"
@@ -172,7 +178,7 @@ if run_analysis or 'data' not in st.session_state:
             st.stop()
 
 # Display results
-if 'data' in st.session_state:
+if _results_ready():
     df = st.session_state['data']
     regimes = st.session_state['regimes']
     confidence = st.session_state['confidence']
